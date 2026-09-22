@@ -1,0 +1,172 @@
+name: Build APK from Web App ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      webapp_zip_url:
+        description: 'لینک مستقیم دانلود ZIP وب‌اپ (شامل index.html در ریشه). اگر خالی باشد از HTML/URL پیش‌فرض تمپلیت استفاده می‌شود.'
+        required: false
+        default: ''
+      source_mode:
+        description: 'URL یا LOCAL_ASSET'
+        required: true
+        default: 'LOCAL_ASSET'
+        type: choice
+        options: [ 'URL', 'LOCAL_ASSET' ]
+      start_url:
+        description: 'فقط در حالت URL استفاده می‌شود'
+        required: false
+        default: 'https://example.com'
+      app_name:
+        required: true
+        default: 'My Web App'
+      package_name:
+        required: true
+        default: 'com.example.mywebapp'
+      version_name:
+        required: true
+        default: '1.0'
+      version_code:
+        required: true
+        default: '1'
+      orientation:
+        required: true
+        default: 'unspecified'
+        type: choice
+        options: [ 'unspecified', 'portrait', 'landscape', 'sensor' ]
+      dark_mode:
+        required: true
+        default: 'system'
+        type: choice
+        options: [ 'light', 'dark', 'system' ]
+      permission_camera:
+        required: true
+        default: 'false'
+        type: boolean
+      permission_microphone:
+        required: true
+        default: 'false'
+        type: boolean
+      permission_file_access:
+        required: true
+        default: 'true'
+        type: boolean
+      build_type:
+        required: true
+        default: 'debug'
+        type: choice
+        options: [ 'debug', 'release' ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout template repo
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # -------- ۱. استخراج ZIP وب‌اپ (اگر حالت LOCAL_ASSET بود) --------
+      - name: Download & extract web app ZIP into assets
+        if: ${{ github.event.inputs.source_mode == 'LOCAL_ASSET' && github.event.inputs.webapp_zip_url != '' }}
+        run: |
+          set -e
+          echo "Downloading ${{ github.event.inputs.webapp_zip_url }}"
+          curl -L -o webapp.zip "${{ github.event.inputs.webapp_zip_url }}"
+
+          rm -rf app/src/main/assets/webapp
+          mkdir -p app/src/main/assets/webapp
+          unzip -q webapp.zip -d /tmp/webapp_extracted
+
+          # اگر index.html مستقیم در ریشه نبود، اولین index.html پیداشده را
+          # به ریشه منتقل می‌کند (پشتیبانی از ZIPهایی که یک پوشهٔ اضافه دارند)
+          if [ -f /tmp/webapp_extracted/index.html ]; then
+            cp -r /tmp/webapp_extracted/. app/src/main/assets/webapp/
+          else
+            SRC_DIR=$(dirname "$(find /tmp/webapp_extracted -name index.html -print -quit)")
+            if [ -z "$SRC_DIR" ]; then
+              echo "::error::index.html در ZIP پیدا نشد"
+              exit 1
+            fi
+            cp -r "$SRC_DIR/." app/src/main/assets/webapp/
+          fi
+
+          echo "Extracted files:"
+          find app/src/main/assets/webapp -maxdepth 2
+
+      - name: Verify index.html exists for LOCAL_ASSET mode
+        if: ${{ github.event.inputs.source_mode == 'LOCAL_ASSET' }}
+        run: |
+          if [ ! -f app/src/main/assets/webapp/index.html ]; then
+            echo "::error::app/src/main/assets/webapp/index.html موجود نیست"
+            exit 1
+          fi
+
+      # -------- ۲. تزریق تنظیمات کاربر در gradle.properties --------
+      - name: Write webapp.* config into gradle.properties
+        run: |
+          set -e
+          FILE="gradle.properties"
+
+          set_prop () {
+            KEY="$1"; VAL="$2"
+            if grep -q "^${KEY}=" "$FILE"; then
+              sed -i "s|^${KEY}=.*|${KEY}=${VAL}|" "$FILE"
+            else
+              echo "${KEY}=${VAL}" >> "$FILE"
+            fi
+          }
+
+          set_prop "webapp.appName" "${{ github.event.inputs.app_name }}"
+          set_prop "webapp.packageName" "${{ github.event.inputs.package_name }}"
+          set_prop "webapp.versionName" "${{ github.event.inputs.version_name }}"
+          set_prop "webapp.versionCode" "${{ github.event.inputs.version_code }}"
+          set_prop "webapp.startUrl" "${{ github.event.inputs.start_url }}"
+          set_prop "webapp.sourceMode" "${{ github.event.inputs.source_mode }}"
+          set_prop "webapp.orientation" "${{ github.event.inputs.orientation }}"
+          set_prop "webapp.darkMode" "${{ github.event.inputs.dark_mode }}"
+          set_prop "webapp.permissionCamera" "${{ github.event.inputs.permission_camera }}"
+          set_prop "webapp.permissionMicrophone" "${{ github.event.inputs.permission_microphone }}"
+          set_prop "webapp.permissionFileAccess" "${{ github.event.inputs.permission_file_access }}"
+
+          echo "----- gradle.properties -----"
+          cat "$FILE"
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # -------- ۳. Build --------
+      - name: Build debug APK
+        if: ${{ github.event.inputs.build_type == 'debug' }}
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Build release APK (unsigned unless keystore secrets provided)
+        if: ${{ github.event.inputs.build_type == 'release' }}
+        env:
+          RELEASE_STORE_FILE: ${{ secrets.RELEASE_STORE_FILE_PATH }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          if [ -n "$RELEASE_STORE_FILE" ]; then
+            ./gradlew :app:assembleRelease --no-daemon \
+              -PRELEASE_STORE_FILE="$RELEASE_STORE_FILE" \
+              -PRELEASE_STORE_PASSWORD="$RELEASE_STORE_PASSWORD" \
+              -PRELEASE_KEY_ALIAS="$RELEASE_KEY_ALIAS" \
+              -PRELEASE_KEY_PASSWORD="$RELEASE_KEY_PASSWORD"
+          else
+            echo "::warning::Keystore secrets تنظیم نشده — Release بدون امضا ساخته می‌شود."
+            ./gradlew :app:assembleRelease --no-daemon
+          fi
+
+      # -------- ۴. خروجی --------
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.app_name }}-${{ github.event.inputs.build_type }}-apk
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
